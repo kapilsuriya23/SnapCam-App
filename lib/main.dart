@@ -46,8 +46,17 @@ class VideoCapturePage extends StatefulWidget {
 class _VideoCapturePageState extends State<VideoCapturePage>
     with TickerProviderStateMixin {
   CameraController? controller;
-  int _currentCameraIndex = 0; // 0 = back, 1 = front
+  int _currentCameraIndex = 0;
   bool _isSwitchingCamera = false;
+
+  // Flash — cycles through: off → on → auto → off
+  final List<FlashMode> _flashModes = [
+    FlashMode.off,
+    FlashMode.always,
+    FlashMode.auto,
+  ];
+  int _flashModeIndex = 0;
+  FlashMode get _currentFlashMode => _flashModes[_flashModeIndex];
 
   bool isRecording = false;
   bool _isTakingPhoto = false;
@@ -69,10 +78,12 @@ class _VideoCapturePageState extends State<VideoCapturePage>
   late AnimationController _shutterController;
   late AnimationController _photoCountController;
   late AnimationController _flipController;
+  late AnimationController _flashController;
   late Animation<double> _pulseAnim;
   late Animation<double> _shutterScaleAnim;
   late Animation<double> _photoCountScaleAnim;
   late Animation<double> _flipAnim;
+  late Animation<double> _flashAnim;
 
   @override
   void initState() {
@@ -116,7 +127,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
           ),
         );
 
-    // Flip animation — full 360 spin
     _flipController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 400),
@@ -124,6 +134,24 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     _flipAnim = Tween<double>(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(parent: _flipController, curve: Curves.easeInOut),
     );
+
+    // Flash icon scale-pop on tap
+    _flashController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+    );
+    _flashAnim = TweenSequence(
+      [
+        TweenSequenceItem(
+          tween: Tween<double>(begin: 1.0, end: 1.4),
+          weight: 50,
+        ),
+        TweenSequenceItem(
+          tween: Tween<double>(begin: 1.4, end: 1.0),
+          weight: 50,
+        ),
+      ],
+    ).animate(CurvedAnimation(parent: _flashController, curve: Curves.easeOut));
 
     initCamera();
   }
@@ -143,7 +171,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
   Future<void> _initCameraAt(int index) async {
     if (index >= cameras.length) return;
 
-    // Dispose old controller first
     final oldController = controller;
     controller = null;
     if (mounted) setState(() {});
@@ -156,17 +183,18 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     );
 
     await newController.initialize();
+
+    // Apply current flash mode to new controller
+    await newController.setFlashMode(_currentFlashMode);
+
     controller = newController;
     if (mounted) setState(() {});
   }
 
   Future<void> toggleCamera() async {
-    // Cannot switch while recording or switching
     if (isRecording || _isSwitchingCamera || cameras.length < 2) return;
 
     setState(() => _isSwitchingCamera = true);
-
-    // Play flip spin animation
     _flipController.forward(from: 0);
 
     final nextIndex = (_currentCameraIndex == 0) ? 1 : 0;
@@ -174,13 +202,68 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
     await _initCameraAt(nextIndex);
 
+    // Front camera has no flash — reset to off if switching to front
+    if (_isFrontCamera && _currentFlashMode != FlashMode.off) {
+      _flashModeIndex = 0;
+      if (mounted) setState(() {});
+    }
+
     if (mounted) setState(() => _isSwitchingCamera = false);
+  }
+
+  Future<void> cycleFlashMode() async {
+    // Front camera has no flash hardware
+    if (_isFrontCamera) return;
+
+    _flashController.forward(from: 0);
+
+    final nextIndex = (_flashModeIndex + 1) % _flashModes.length;
+    _flashModeIndex = nextIndex;
+
+    try {
+      await controller?.setFlashMode(_currentFlashMode);
+    } catch (e) {
+      debugPrint('Flash error: $e');
+    }
+
+    if (mounted) setState(() {});
   }
 
   bool get _isFrontCamera =>
       cameras.isNotEmpty &&
       _currentCameraIndex < cameras.length &&
       cameras[_currentCameraIndex].lensDirection == CameraLensDirection.front;
+
+  // Returns icon for current flash mode
+  IconData get _flashIcon {
+    switch (_currentFlashMode) {
+      case FlashMode.off:
+        return Icons.flash_off_rounded;
+      case FlashMode.always:
+        return Icons.flash_on_rounded;
+      case FlashMode.auto:
+        return Icons.flash_auto_rounded;
+      default:
+        return Icons.flash_off_rounded;
+    }
+  }
+
+  // Returns label shown under icon
+  String get _flashLabel {
+    switch (_currentFlashMode) {
+      case FlashMode.off:
+        return 'OFF';
+      case FlashMode.always:
+        return 'ON';
+      case FlashMode.auto:
+        return 'AUTO';
+      default:
+        return 'OFF';
+    }
+  }
+
+  // Torch and ON flash modes get a yellow accent
+  bool get _flashIsActive => _currentFlashMode == FlashMode.always;
 
   String formatTime(int seconds) {
     final minutes = (seconds ~/ 60).toString().padLeft(2, '0');
@@ -306,6 +389,7 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     _shutterController.dispose();
     _photoCountController.dispose();
     _flipController.dispose();
+    _flashController.dispose();
     super.dispose();
   }
 
@@ -413,7 +497,7 @@ class _VideoCapturePageState extends State<VideoCapturePage>
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Recording badge
+                // Left: recording badge (or empty space)
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 300),
                   child: isRecording
@@ -425,7 +509,23 @@ class _VideoCapturePageState extends State<VideoCapturePage>
                       : const SizedBox(key: ValueKey('idle'), width: 80),
                 ),
 
-                // Photo count badge
+                // Center: flash button (hidden while recording)
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  child: !isRecording
+                      ? _FlashButton(
+                          key: const ValueKey('flash'),
+                          icon: _flashIcon,
+                          label: _flashLabel,
+                          isActive: _flashIsActive,
+                          isDisabled: _isFrontCamera,
+                          scaleAnim: _flashAnim,
+                          onTap: cycleFlashMode,
+                        )
+                      : const SizedBox(key: ValueKey('no-flash'), width: 60),
+                ),
+
+                // Right: photo count badge (recording) or empty
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 300),
                   child: isRecording
@@ -451,17 +551,14 @@ class _VideoCapturePageState extends State<VideoCapturePage>
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
-                  // Gallery thumbnail
                   _GalleryThumb(file: lastPhotoFile, onTap: openLastPhoto),
 
-                  // Main record button
                   _RecordButton(
                     isRecording: isRecording,
                     onTap: isRecording ? stopRecording : startRecording,
                     pulseAnim: _pulseAnim,
                   ),
 
-                  // Right side: shutter (recording) or flip (idle)
                   AnimatedSwitcher(
                     duration: const Duration(milliseconds: 200),
                     child: isRecording
@@ -486,6 +583,75 @@ class _VideoCapturePageState extends State<VideoCapturePage>
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ── Flash button ──────────────────────────────────────────────────────────────
+class _FlashButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool isActive; // true when flash ON or TORCH
+  final bool isDisabled; // true for front camera
+  final Animation<double> scaleAnim;
+  final VoidCallback onTap;
+
+  const _FlashButton({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.isActive,
+    required this.isDisabled,
+    required this.scaleAnim,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isActive
+        ? const Color(0xFFFFD60A) // yellow when active
+        : Colors.white;
+
+    return GestureDetector(
+      onTap: isDisabled ? null : onTap,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 200),
+        opacity: isDisabled ? 0.25 : 1.0,
+        child: ScaleTransition(
+          scale: scaleAnim,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: isActive
+                  ? const Color(0xFFFFD60A).withValues(alpha: 0.15)
+                  : Colors.black.withValues(alpha: 0.45),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(
+                color: isActive
+                    ? const Color(0xFFFFD60A).withValues(alpha: 0.6)
+                    : Colors.white.withValues(alpha: 0.2),
+                width: 0.8,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: color),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w400,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -786,12 +952,10 @@ class _FlipButton extends StatelessWidget {
             child: AnimatedBuilder(
               animation: flipAnim,
               builder: (_, child) => Transform.rotate(
-                // Rotates 360° during the flip animation
                 angle: flipAnim.value * 2 * math.pi,
                 child: child,
               ),
               child: Icon(
-                // Icon changes to reflect which camera is currently active
                 isFront
                     ? Icons.camera_front_outlined
                     : Icons.camera_rear_outlined,
