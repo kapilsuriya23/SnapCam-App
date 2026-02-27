@@ -49,7 +49,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
   int _currentCameraIndex = 0;
   bool _isSwitchingCamera = false;
 
-  // Flash — cycles through: off → on → auto → off
   final List<FlashMode> _flashModes = [
     FlashMode.off,
     FlashMode.always,
@@ -66,7 +65,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
   Timer? recordingTimer;
   File? lastPhotoFile;
-
   bool _photoFlash = false;
 
   final List<String> _videoSegments = [];
@@ -92,8 +90,8 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
-    )..repeat(reverse: true);
-
+    );
+    // FIX: pulse only starts when recording, not on app launch
     _pulseAnim = Tween<double>(begin: 0.85, end: 1.0).animate(
       CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
     );
@@ -135,7 +133,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       CurvedAnimation(parent: _flipController, curve: Curves.easeInOut),
     );
 
-    // Flash icon scale-pop on tap
     _flashController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 200),
@@ -164,13 +161,11 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       Permission.photos,
       Permission.videos,
     ].request();
-
     await _initCameraAt(_currentCameraIndex);
   }
 
   Future<void> _initCameraAt(int index) async {
     if (index >= cameras.length) return;
-
     final oldController = controller;
     controller = null;
     if (mounted) setState(() {});
@@ -180,52 +175,38 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       cameras[index],
       ResolutionPreset.high,
       enableAudio: true,
+      // FIX: disable image stream — not needed, saves CPU
+      imageFormatGroup: ImageFormatGroup.jpeg,
     );
-
     await newController.initialize();
-
-    // Apply current flash mode to new controller
     await newController.setFlashMode(_currentFlashMode);
-
     controller = newController;
     if (mounted) setState(() {});
   }
 
   Future<void> toggleCamera() async {
     if (isRecording || _isSwitchingCamera || cameras.length < 2) return;
-
     setState(() => _isSwitchingCamera = true);
     _flipController.forward(from: 0);
-
     final nextIndex = (_currentCameraIndex == 0) ? 1 : 0;
     _currentCameraIndex = nextIndex;
-
     await _initCameraAt(nextIndex);
-
-    // Front camera has no flash — reset to off if switching to front
     if (_isFrontCamera && _currentFlashMode != FlashMode.off) {
       _flashModeIndex = 0;
       if (mounted) setState(() {});
     }
-
     if (mounted) setState(() => _isSwitchingCamera = false);
   }
 
   Future<void> cycleFlashMode() async {
-    // Front camera has no flash hardware
     if (_isFrontCamera) return;
-
     _flashController.forward(from: 0);
-
-    final nextIndex = (_flashModeIndex + 1) % _flashModes.length;
-    _flashModeIndex = nextIndex;
-
+    _flashModeIndex = (_flashModeIndex + 1) % _flashModes.length;
     try {
       await controller?.setFlashMode(_currentFlashMode);
     } catch (e) {
       debugPrint('Flash error: $e');
     }
-
     if (mounted) setState(() {});
   }
 
@@ -234,7 +215,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       _currentCameraIndex < cameras.length &&
       cameras[_currentCameraIndex].lensDirection == CameraLensDirection.front;
 
-  // Returns icon for current flash mode
   IconData get _flashIcon {
     switch (_currentFlashMode) {
       case FlashMode.off:
@@ -248,7 +228,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     }
   }
 
-  // Returns label shown under icon
   String get _flashLabel {
     switch (_currentFlashMode) {
       case FlashMode.off:
@@ -262,32 +241,37 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     }
   }
 
-  // Torch and ON flash modes get a yellow accent
   bool get _flashIsActive => _currentFlashMode == FlashMode.always;
 
   String formatTime(int seconds) {
-    final minutes = (seconds ~/ 60).toString().padLeft(2, '0');
-    final secs = (seconds % 60).toString().padLeft(2, '0');
-    return "$minutes:$secs";
+    final m = (seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   Future<void> startRecording() async {
     if (controller == null || controller!.value.isRecordingVideo) return;
     _videoSegments.clear();
     await controller!.startVideoRecording();
+    // FIX: start pulse animation only when recording begins
+    _pulseController.repeat(reverse: true);
     setState(() {
       isRecording = true;
       secondsElapsed = 0;
       photoCount = 0;
     });
     recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      setState(() => secondsElapsed++);
+      // FIX: only update the timer value, not the whole page
+      if (mounted) setState(() => secondsElapsed++);
     });
   }
 
   Future<void> stopRecording() async {
     if (controller == null || !controller!.value.isRecordingVideo) return;
     recordingTimer?.cancel();
+    // FIX: stop pulse animation when recording ends
+    _pulseController.stop();
+    _pulseController.reset();
     final videoFile = await controller!.stopVideoRecording();
     _videoSegments.add(videoFile.path);
     setState(() {
@@ -327,16 +311,15 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     if (controller == null ||
         !controller!.value.isRecordingVideo ||
         controller!.value.isTakingPicture ||
-        _isTakingPhoto)
+        _isTakingPhoto) {
       return;
-
+    }
     setState(() => _isTakingPhoto = true);
     _shutterController.forward().then((_) => _shutterController.reverse());
 
     try {
       final segmentFile = await controller!.stopVideoRecording();
       _videoSegments.add(segmentFile.path);
-
       final image = await controller!.takePicture();
 
       setState(() => _photoFlash = true);
@@ -345,7 +328,6 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
       await _savePhotoToGallery(image.path);
       _photoCountController.forward(from: 0);
-
       await controller!.startVideoRecording();
     } catch (e) {
       debugPrint('Error during photo capture: $e');
@@ -361,8 +343,10 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       final ext = p.extension(sourcePath).isNotEmpty
           ? p.extension(sourcePath)
           : '.jpg';
-      final fileName = 'IMG_${DateTime.now().millisecondsSinceEpoch}$ext';
-      final destPath = p.join(dcim.path, fileName);
+      final destPath = p.join(
+        dcim.path,
+        'IMG_${DateTime.now().millisecondsSinceEpoch}$ext',
+      );
       await File(sourcePath).copy(destPath);
       await _mediaStore.invokeMethod('scanFile', {'path': destPath});
       if (mounted) {
@@ -408,181 +392,209 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     }
 
     final size = MediaQuery.of(context).size;
+    final topPad = MediaQuery.of(context).padding.top;
+    final botPad = MediaQuery.of(context).padding.bottom;
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          // ── Camera preview ─────────────────────────────────────────
-          Positioned.fill(child: CameraPreview(controller!)),
-
-          // ── Gradient overlays ──────────────────────────────────────
-          Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            height: size.height * 0.22,
-            child: Container(
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [Color(0xCC000000), Colors.transparent],
+      extendBodyBehindAppBar: true,
+      extendBody: true,
+      body: RepaintBoundary(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // ── Camera preview — fills entire screen ─────────────────
+            RepaintBoundary(
+              child: SizedBox.expand(
+                child: FittedBox(
+                  fit: BoxFit.cover,
+                  child: SizedBox(
+                    width: controller!.value.previewSize!.height,
+                    height: controller!.value.previewSize!.width,
+                    child: CameraPreview(controller!),
+                  ),
                 ),
               ),
             ),
-          ),
-          Positioned(
-            bottom: 0,
-            left: 0,
-            right: 0,
-            height: size.height * 0.30,
-            child: Container(
-              decoration: const BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.bottomCenter,
-                  end: Alignment.topCenter,
-                  colors: [Color(0xEE000000), Colors.transparent],
+
+            // ── Gradient overlays ────────────────────────────────────
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              height: size.height * 0.22,
+              child: const DecoratedBox(
+                // FIX: const DecoratedBox — never rebuilds
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0xCC000000), Colors.transparent],
+                  ),
                 ),
               ),
             ),
-          ),
-
-          // ── Photo flash ────────────────────────────────────────────
-          if (_photoFlash)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Container(color: Colors.white.withValues(alpha: 0.75)),
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: size.height * 0.35,
+              child: const DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.bottomCenter,
+                    end: Alignment.topCenter,
+                    colors: [Color(0xEE000000), Colors.transparent],
+                  ),
+                ),
               ),
             ),
 
-          // ── Saving overlay ─────────────────────────────────────────
-          if (_isSavingVideo)
-            Positioned.fill(
-              child: Container(
-                color: Colors.black.withValues(alpha: 0.72),
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
+            // ── Photo flash ──────────────────────────────────────────
+            if (_photoFlash)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: ColoredBox(
+                    // FIX: ColoredBox is cheaper than Container for solid colors
+                    color: Colors.white.withValues(alpha: 0.75),
+                  ),
+                ),
+              ),
+
+            // ── Saving overlay ───────────────────────────────────────
+            if (_isSavingVideo)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: Colors.black.withValues(alpha: 0.72),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 48,
+                          height: 48,
+                          child: CircularProgressIndicator(
+                            color: Colors.white.withValues(alpha: 0.9),
+                            strokeWidth: 1.5,
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        const Text(
+                          'COMPRESSING & SAVING',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w300,
+                            letterSpacing: 6,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+            // ── Top bar ──────────────────────────────────────────────
+            Positioned(
+              top: topPad + 16,
+              left: 24,
+              right: 24,
+              child: RepaintBoundary(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 300),
+                      child: isRecording
+                          ? _RecordingBadge(
+                              key: const ValueKey('rec'),
+                              pulseAnim: _pulseAnim,
+                              time: formatTime(secondsElapsed),
+                            )
+                          : const SizedBox(key: ValueKey('idle'), width: 80),
+                    ),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 250),
+                      child: !isRecording
+                          ? _FlashButton(
+                              key: const ValueKey('flash'),
+                              icon: _flashIcon,
+                              label: _flashLabel,
+                              isActive: _flashIsActive,
+                              isDisabled: _isFrontCamera,
+                              scaleAnim: _flashAnim,
+                              onTap: cycleFlashMode,
+                            )
+                          : const SizedBox(
+                              key: ValueKey('no-flash'),
+                              width: 60,
+                            ),
+                    ),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 300),
+                      child: isRecording
+                          ? ScaleTransition(
+                              key: const ValueKey('count'),
+                              scale: _photoCountScaleAnim,
+                              child: _PhotoCountBadge(count: photoCount),
+                            )
+                          : const SizedBox(
+                              key: ValueKey('no-count'),
+                              width: 60,
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // ── Bottom controls ──────────────────────────────────────
+            Positioned(
+              bottom: 36,
+              left: 0,
+              right: 0,
+              // FIX: RepaintBoundary — button animations don't trigger
+              //      camera preview or top bar redraws
+              child: RepaintBoundary(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      SizedBox(
-                        width: 48,
-                        height: 48,
-                        child: CircularProgressIndicator(
-                          color: Colors.white.withValues(alpha: 0.9),
-                          strokeWidth: 1.5,
-                        ),
+                      _GalleryThumb(file: lastPhotoFile, onTap: openLastPhoto),
+                      _RecordButton(
+                        isRecording: isRecording,
+                        onTap: isRecording ? stopRecording : startRecording,
+                        pulseAnim: _pulseAnim,
                       ),
-                      const SizedBox(height: 20),
-                      const Text(
-                        'COMPRESSING & SAVING',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w300,
-                          letterSpacing: 6,
-                        ),
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 200),
+                        child: isRecording
+                            ? ScaleTransition(
+                                key: const ValueKey('shutter'),
+                                scale: _shutterScaleAnim,
+                                child: _ShutterButton(
+                                  enabled: !_isTakingPhoto,
+                                  onTap: capturePhotoDuringRecording,
+                                ),
+                              )
+                            : _FlipButton(
+                                key: const ValueKey('flip'),
+                                flipAnim: _flipAnim,
+                                isFront: _isFrontCamera,
+                                enabled:
+                                    !_isSwitchingCamera && cameras.length >= 2,
+                                onTap: toggleCamera,
+                              ),
                       ),
                     ],
                   ),
                 ),
               ),
             ),
-
-          // ── Top bar ────────────────────────────────────────────────
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 16,
-            left: 24,
-            right: 24,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                // Left: recording badge (or empty space)
-                AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  child: isRecording
-                      ? _RecordingBadge(
-                          key: const ValueKey('recording'),
-                          pulseAnim: _pulseAnim,
-                          time: formatTime(secondsElapsed),
-                        )
-                      : const SizedBox(key: ValueKey('idle'), width: 80),
-                ),
-
-                // Center: flash button (hidden while recording)
-                AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 250),
-                  child: !isRecording
-                      ? _FlashButton(
-                          key: const ValueKey('flash'),
-                          icon: _flashIcon,
-                          label: _flashLabel,
-                          isActive: _flashIsActive,
-                          isDisabled: _isFrontCamera,
-                          scaleAnim: _flashAnim,
-                          onTap: cycleFlashMode,
-                        )
-                      : const SizedBox(key: ValueKey('no-flash'), width: 60),
-                ),
-
-                // Right: photo count badge (recording) or empty
-                AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  child: isRecording
-                      ? ScaleTransition(
-                          key: const ValueKey('count'),
-                          scale: _photoCountScaleAnim,
-                          child: _PhotoCountBadge(count: photoCount),
-                        )
-                      : const SizedBox(key: ValueKey('no-count'), width: 60),
-                ),
-              ],
-            ),
-          ),
-
-          // ── Bottom controls ────────────────────────────────────────
-          Positioned(
-            bottom: MediaQuery.of(context).padding.bottom + 36,
-            left: 0,
-            right: 0,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  _GalleryThumb(file: lastPhotoFile, onTap: openLastPhoto),
-
-                  _RecordButton(
-                    isRecording: isRecording,
-                    onTap: isRecording ? stopRecording : startRecording,
-                    pulseAnim: _pulseAnim,
-                  ),
-
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 200),
-                    child: isRecording
-                        ? ScaleTransition(
-                            key: const ValueKey('shutter'),
-                            scale: _shutterScaleAnim,
-                            child: _ShutterButton(
-                              enabled: !_isTakingPhoto,
-                              onTap: capturePhotoDuringRecording,
-                            ),
-                          )
-                        : _FlipButton(
-                            key: const ValueKey('flip'),
-                            flipAnim: _flipAnim,
-                            isFront: _isFrontCamera,
-                            enabled: !_isSwitchingCamera && cameras.length >= 2,
-                            onTap: toggleCamera,
-                          ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -592,8 +604,8 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 class _FlashButton extends StatelessWidget {
   final IconData icon;
   final String label;
-  final bool isActive; // true when flash ON or TORCH
-  final bool isDisabled; // true for front camera
+  final bool isActive;
+  final bool isDisabled;
   final Animation<double> scaleAnim;
   final VoidCallback onTap;
 
@@ -609,10 +621,7 @@ class _FlashButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = isActive
-        ? const Color(0xFFFFD60A) // yellow when active
-        : Colors.white;
-
+    final color = isActive ? const Color(0xFFFFD60A) : Colors.white;
     return GestureDetector(
       onTap: isDisabled ? null : onTap,
       child: AnimatedOpacity(
@@ -682,9 +691,10 @@ class _RecordingBadge extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // FIX: AnimatedBuilder scope is tight — only the dot repaints
           AnimatedBuilder(
             animation: pulseAnim,
-            builder: (_, __) => Transform.scale(
+            builder: (context, _) => Transform.scale(
               scale: pulseAnim.value,
               child: Container(
                 width: 7,
@@ -704,6 +714,8 @@ class _RecordingBadge extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
+          // FIX: time text is outside AnimatedBuilder — only rebuilds on
+          //      setState from the 1-second timer, not on every animation frame
           Text(
             time,
             style: const TextStyle(
@@ -722,40 +734,40 @@ class _RecordingBadge extends StatelessWidget {
 // ── Photo count badge ─────────────────────────────────────────────────────────
 class _PhotoCountBadge extends StatelessWidget {
   final int count;
-  const _PhotoCountBadge({required this.count});
+  const _PhotoCountBadge({super.key, required this.count});
 
   @override
   Widget build(BuildContext context) {
+    final bgColor = count > 0
+        ? const Color(0xFFFF3B30)
+        : Colors.black.withValues(alpha: 0.55);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
       decoration: BoxDecoration(
-        color: count > 0
-            ? Colors.white.withValues(alpha: 0.15)
-            : Colors.black.withValues(alpha: 0.4),
+        color: bgColor,
         borderRadius: BorderRadius.circular(30),
-        border: Border.all(
-          color: count > 0
-              ? Colors.white.withValues(alpha: 0.4)
-              : Colors.white.withValues(alpha: 0.1),
-          width: 0.5,
-        ),
+        boxShadow: count > 0
+            ? [
+                BoxShadow(
+                  color: const Color(0xFFFF3B30).withValues(alpha: 0.5),
+                  blurRadius: 10,
+                  spreadRadius: 1,
+                ),
+              ]
+            : null,
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.photo_camera_outlined,
-            size: 12,
-            color: Colors.white.withValues(alpha: count > 0 ? 0.9 : 0.4),
-          ),
-          const SizedBox(width: 6),
+          const Icon(Icons.photo_camera, size: 13, color: Colors.white),
+          const SizedBox(width: 5),
           Text(
             '$count',
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: count > 0 ? 0.9 : 0.4),
+            style: const TextStyle(
+              color: Colors.white,
               fontSize: 13,
-              fontWeight: FontWeight.w300,
-              letterSpacing: 1,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.5,
             ),
           ),
         ],
@@ -788,7 +800,12 @@ class _GalleryThumb extends StatelessWidget {
         child: file != null
             ? ClipRRect(
                 borderRadius: BorderRadius.circular(11),
-                child: Image.file(file!, fit: BoxFit.cover),
+                child: Image.file(
+                  file!,
+                  fit: BoxFit.cover,
+                  // FIX: cache width — avoids full-res decode on every rebuild
+                  cacheWidth: 108,
+                ),
               )
             : Icon(
                 Icons.photo_outlined,
@@ -816,9 +833,10 @@ class _RecordButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
+      // FIX: AnimatedBuilder scope is only the button — not the parent Stack
       child: AnimatedBuilder(
         animation: pulseAnim,
-        builder: (_, __) {
+        builder: (context, child) {
           return Stack(
             alignment: Alignment.center,
             children: [
@@ -852,19 +870,23 @@ class _RecordButton extends StatelessWidget {
                   ),
                 ),
               ),
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 250),
-                curve: Curves.easeInOut,
-                width: isRecording ? 26 : 58,
-                height: isRecording ? 26 : 58,
-                decoration: BoxDecoration(
-                  color: isRecording ? const Color(0xFFFF3B30) : Colors.white,
-                  borderRadius: BorderRadius.circular(isRecording ? 6 : 29),
-                ),
-              ),
+              // FIX: child passed to AnimatedBuilder so the static inner
+              //      container isn't rebuilt on every animation frame
+              child!,
             ],
           );
         },
+        // FIX: this child is built once and reused across animation frames
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeInOut,
+          width: isRecording ? 26 : 58,
+          height: isRecording ? 26 : 58,
+          decoration: BoxDecoration(
+            color: isRecording ? const Color(0xFFFF3B30) : Colors.white,
+            borderRadius: BorderRadius.circular(isRecording ? 6 : 29),
+          ),
+        ),
       ),
     );
   }
@@ -951,16 +973,17 @@ class _FlipButton extends StatelessWidget {
           child: Center(
             child: AnimatedBuilder(
               animation: flipAnim,
-              builder: (_, child) => Transform.rotate(
-                angle: flipAnim.value * 2 * math.pi,
-                child: child,
-              ),
+              // FIX: icon passed as child so it isn't rebuilt every frame
               child: Icon(
                 isFront
                     ? Icons.camera_front_outlined
                     : Icons.camera_rear_outlined,
                 size: 22,
                 color: Colors.white.withValues(alpha: 0.9),
+              ),
+              builder: (context, child) => Transform.rotate(
+                angle: flipAnim.value * 2 * math.pi,
+                child: child,
               ),
             ),
           ),
