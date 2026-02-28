@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path/path.dart' as p;
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
 late List<CameraDescription> cameras;
@@ -65,6 +66,8 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
   Timer? recordingTimer;
   File? lastPhotoFile;
+  final List<File> _sessionPhotos = []; // all photos in current/last session
+  String? _lastSavedVideoPath; // video path from last session
   bool _photoFlash = false;
 
   final List<String> _videoSegments = [];
@@ -252,8 +255,11 @@ class _VideoCapturePageState extends State<VideoCapturePage>
   Future<void> startRecording() async {
     if (controller == null || controller!.value.isRecordingVideo) return;
     _videoSegments.clear();
+    _sessionPhotos.clear();
+    _lastSavedVideoPath = null;
     await controller!.startVideoRecording();
-    // FIX: start pulse animation only when recording begins
+    // Keep screen on while recording
+    await WakelockPlus.enable();
     _pulseController.repeat(reverse: true);
     setState(() {
       isRecording = true;
@@ -269,6 +275,8 @@ class _VideoCapturePageState extends State<VideoCapturePage>
   Future<void> stopRecording() async {
     if (controller == null || !controller!.value.isRecordingVideo) return;
     recordingTimer?.cancel();
+    // Release screen lock when recording ends
+    await WakelockPlus.disable();
     // FIX: stop pulse animation when recording ends
     _pulseController.stop();
     _pulseController.reset();
@@ -285,6 +293,7 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       await _mediaStore.invokeMethod('saveVideoToGallery', {
         'path': stitchedPath,
       });
+      if (mounted) setState(() => _lastSavedVideoPath = stitchedPath);
     } catch (e) {
       debugPrint('Failed to save video: $e');
     } finally {
@@ -338,13 +347,13 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
   Future<void> _savePhotoToGallery(String sourcePath) async {
     try {
-      final snapcam = Directory('/storage/emulated/0/DCIM/SnapCam');
-      if (!await snapcam.exists()) await snapcam.create(recursive: true);
+      final photos = Directory('/storage/emulated/0/DCIM/SnapCam/Photos');
+      if (!await photos.exists()) await photos.create(recursive: true);
       final ext = p.extension(sourcePath).isNotEmpty
           ? p.extension(sourcePath)
           : '.jpg';
       final destPath = p.join(
-        snapcam.path,
+        photos.path,
         'IMG_${DateTime.now().millisecondsSinceEpoch}$ext',
       );
       await File(sourcePath).copy(destPath);
@@ -352,6 +361,7 @@ class _VideoCapturePageState extends State<VideoCapturePage>
       if (mounted) {
         setState(() {
           lastPhotoFile = File(destPath);
+          _sessionPhotos.add(File(destPath));
           photoCount++;
         });
       }
@@ -360,14 +370,24 @@ class _VideoCapturePageState extends State<VideoCapturePage>
     }
   }
 
-  Future<void> openLastPhoto() async {
-    if (lastPhotoFile == null) return;
-    await OpenFilex.open(lastPhotoFile!.path);
+  void openSessionGallery() {
+    final photos = List<File>.from(_sessionPhotos);
+    final videoPath = _lastSavedVideoPath;
+    if (photos.isEmpty && videoPath == null) return;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) =>
+          _SessionGallerySheet(photos: photos, videoPath: videoPath),
+    );
   }
 
   @override
   void dispose() {
     recordingTimer?.cancel();
+    WakelockPlus.disable(); // safety — release if app killed mid-recording
     controller?.dispose();
     _pulseController.dispose();
     _shutterController.dispose();
@@ -568,7 +588,10 @@ class _VideoCapturePageState extends State<VideoCapturePage>
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      _GalleryThumb(file: lastPhotoFile, onTap: openLastPhoto),
+                      _GalleryThumb(
+                        file: lastPhotoFile,
+                        onTap: openSessionGallery,
+                      ),
                       _RecordButton(
                         isRecording: isRecording,
                         onTap: isRecording ? stopRecording : startRecording,
@@ -1077,4 +1100,266 @@ class _ScannerFramePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+// ── Session Gallery Sheet ─────────────────────────────────────────────────────
+class _SessionGallerySheet extends StatefulWidget {
+  final List<File> photos;
+  final String? videoPath;
+
+  const _SessionGallerySheet({required this.photos, required this.videoPath});
+
+  @override
+  State<_SessionGallerySheet> createState() => _SessionGallerySheetState();
+}
+
+class _SessionGallerySheetState extends State<_SessionGallerySheet> {
+  int _selectedIndex = 0; // 0 = video, 1..n = photos
+
+  // Total items: video (if exists) + photos
+  bool get _hasVideo => widget.videoPath != null;
+  int get _totalItems => (_hasVideo ? 1 : 0) + widget.photos.length;
+
+  // Returns the file for thumbnail at position i
+  // i=0 is video (show first photo as thumb or video icon), i>=1 are photos
+  File? _thumbAt(int i) {
+    if (_hasVideo) {
+      if (i == 0) return widget.photos.isNotEmpty ? widget.photos.first : null;
+      return widget.photos[i - 1];
+    }
+    return widget.photos[i];
+  }
+
+  bool _isVideo(int i) => _hasVideo && i == 0;
+
+  String _labelAt(int i) {
+    if (_isVideo(i)) return 'VIDEO';
+    final photoIndex = _hasVideo ? i : i + 1;
+    return 'PHOTO $photoIndex';
+  }
+
+  Future<void> _openCurrent() async {
+    final isVid = _isVideo(_selectedIndex);
+    if (isVid && widget.videoPath != null) {
+      await OpenFilex.open(widget.videoPath!);
+    } else {
+      final file = _hasVideo
+          ? widget.photos[_selectedIndex - 1]
+          : widget.photos[_selectedIndex];
+      await OpenFilex.open(file.path);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.75,
+      decoration: const BoxDecoration(
+        color: Color(0xFF111111),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      child: Column(
+        children: [
+          // ── Handle ───────────────────────────────────────────────
+          const SizedBox(height: 12),
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white24,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // ── Header ───────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'SESSION  ·  ${widget.photos.length} PHOTO${widget.photos.length != 1 ? 'S' : ''}${_hasVideo ? '  +  VIDEO' : ''}',
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
+                    letterSpacing: 2,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () => Navigator.pop(context),
+                  child: const Icon(
+                    Icons.close,
+                    color: Colors.white38,
+                    size: 20,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ── Main preview ─────────────────────────────────────────
+          Expanded(
+            child: GestureDetector(
+              onTap: _openCurrent,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  // Image preview
+                  if (!_isVideo(_selectedIndex))
+                    Positioned.fill(
+                      child: Image.file(
+                        _hasVideo
+                            ? widget.photos[_selectedIndex - 1]
+                            : widget.photos[_selectedIndex],
+                        fit: BoxFit.contain,
+                      ),
+                    ),
+
+                  // Video placeholder
+                  if (_isVideo(_selectedIndex))
+                    Positioned.fill(
+                      child: widget.photos.isNotEmpty
+                          ? Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                Image.file(
+                                  widget.photos.first,
+                                  fit: BoxFit.contain,
+                                ),
+                                Container(color: Colors.black45),
+                              ],
+                            )
+                          : Container(color: Colors.black54),
+                    ),
+
+                  // Play icon overlay for video
+                  if (_isVideo(_selectedIndex))
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white54, width: 1.5),
+                      ),
+                      child: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                        size: 36,
+                      ),
+                    ),
+
+                  // Tap hint
+                  Positioned(
+                    bottom: 12,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.open_in_new,
+                            size: 11,
+                            color: Colors.white54,
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            'TAP TO OPEN  ·  ${_labelAt(_selectedIndex)}',
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 10,
+                              letterSpacing: 1.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // ── Thumbnail strip ───────────────────────────────────────
+          SizedBox(
+            height: 80,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              itemCount: _totalItems,
+              itemBuilder: (context, i) {
+                final selected = i == _selectedIndex;
+                final isVid = _isVideo(i);
+                final thumb = _thumbAt(i);
+
+                return GestureDetector(
+                  onTap: () => setState(() => _selectedIndex = i),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    width: 56,
+                    height: 56,
+                    margin: const EdgeInsets.only(right: 8),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: selected
+                            ? const Color(0xFFFF3B30)
+                            : Colors.transparent,
+                        width: 2,
+                      ),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // Thumbnail image
+                          if (thumb != null)
+                            Image.file(
+                              thumb,
+                              fit: BoxFit.cover,
+                              cacheWidth: 112,
+                            )
+                          else
+                            Container(color: Colors.white10),
+
+                          // Video badge
+                          if (isVid)
+                            Container(
+                              color: Colors.black45,
+                              child: const Center(
+                                child: Icon(
+                                  Icons.videocam_rounded,
+                                  color: Colors.white70,
+                                  size: 20,
+                                ),
+                              ),
+                            ),
+
+                          // Dim unselected
+                          if (!selected) Container(color: Colors.black38),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+
+          SizedBox(height: MediaQuery.of(context).padding.bottom + 8),
+        ],
+      ),
+    );
+  }
 }
