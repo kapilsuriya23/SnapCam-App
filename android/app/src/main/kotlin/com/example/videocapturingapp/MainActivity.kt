@@ -276,7 +276,7 @@ class MainActivity : FlutterActivity() {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/SnapCam")
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
@@ -288,9 +288,9 @@ class MainActivity : FlutterActivity() {
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
         } else {
-            val dcim = File("/storage/emulated/0/DCIM/Camera")
-            if (!dcim.exists()) dcim.mkdirs()
-            val dest = File(dcim, fileName)
+            val snapcam = File("/storage/emulated/0/DCIM/SnapCam")
+            if (!snapcam.exists()) snapcam.mkdirs()
+            val dest = File(snapcam, fileName)
             file.copyTo(dest, overwrite = true)
             MediaScannerConnection.scanFile(applicationContext, arrayOf(dest.absolutePath), null) { _, _ -> }
         }

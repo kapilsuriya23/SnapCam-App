@@ -338,13 +338,13 @@ class _VideoCapturePageState extends State<VideoCapturePage>
 
   Future<void> _savePhotoToGallery(String sourcePath) async {
     try {
-      final dcim = Directory('/storage/emulated/0/DCIM/Camera');
-      if (!await dcim.exists()) await dcim.create(recursive: true);
+      final snapcam = Directory('/storage/emulated/0/DCIM/SnapCam');
+      if (!await snapcam.exists()) await snapcam.create(recursive: true);
       final ext = p.extension(sourcePath).isNotEmpty
           ? p.extension(sourcePath)
           : '.jpg';
       final destPath = p.join(
-        dcim.path,
+        snapcam.path,
         'IMG_${DateTime.now().millisecondsSinceEpoch}$ext',
       );
       await File(sourcePath).copy(destPath);
@@ -455,11 +455,17 @@ class _VideoCapturePageState extends State<VideoCapturePage>
               Positioned.fill(
                 child: IgnorePointer(
                   child: ColoredBox(
-                    // FIX: ColoredBox is cheaper than Container for solid colors
                     color: Colors.white.withValues(alpha: 0.75),
                   ),
                 ),
               ),
+
+            // ── Scanner frame ────────────────────────────────────────
+            const Positioned.fill(
+              child: IgnorePointer(
+                child: Center(child: _ScannerFrame(size: 220)),
+              ),
+            ),
 
             // ── Saving overlay ───────────────────────────────────────
             if (_isSavingVideo)
@@ -991,4 +997,84 @@ class _FlipButton extends StatelessWidget {
       ),
     );
   }
+}
+
+// ── Scanner frame ─────────────────────────────────────────────────────────────
+class _ScannerFrame extends StatelessWidget {
+  final double size;
+  const _ScannerFrame({required this.size});
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(size: Size(size, size), painter: _ScannerFramePainter());
+  }
+}
+
+class _ScannerFramePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 3.5
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    // Corner arm length — how long each L-shaped corner line is
+    final arm = size.width * 0.18;
+    // Corner radius — slight rounding on the outer corner
+    final r = 10.0;
+
+    final w = size.width;
+    final h = size.height;
+
+    // ── Top-left corner ───────────────────────────────────────────
+    // Horizontal arm
+    canvas.drawLine(Offset(r, 0), Offset(arm, 0), paint);
+    // Vertical arm
+    canvas.drawLine(Offset(0, r), Offset(0, arm), paint);
+    // Rounded corner arc
+    canvas.drawArc(
+      Rect.fromLTWH(0, 0, r * 2, r * 2),
+      math.pi,
+      math.pi / 2,
+      false,
+      paint,
+    );
+
+    // ── Top-right corner ──────────────────────────────────────────
+    canvas.drawLine(Offset(w - arm, 0), Offset(w - r, 0), paint);
+    canvas.drawLine(Offset(w, r), Offset(w, arm), paint);
+    canvas.drawArc(
+      Rect.fromLTWH(w - r * 2, 0, r * 2, r * 2),
+      math.pi * 1.5,
+      math.pi / 2,
+      false,
+      paint,
+    );
+
+    // ── Bottom-left corner ────────────────────────────────────────
+    canvas.drawLine(Offset(0, h - arm), Offset(0, h - r), paint);
+    canvas.drawLine(Offset(r, h), Offset(arm, h), paint);
+    canvas.drawArc(
+      Rect.fromLTWH(0, h - r * 2, r * 2, r * 2),
+      math.pi / 2,
+      math.pi / 2,
+      false,
+      paint,
+    );
+
+    // ── Bottom-right corner ───────────────────────────────────────
+    canvas.drawLine(Offset(w, h - arm), Offset(w, h - r), paint);
+    canvas.drawLine(Offset(w - arm, h), Offset(w - r, h), paint);
+    canvas.drawArc(
+      Rect.fromLTWH(w - r * 2, h - r * 2, r * 2, r * 2),
+      0,
+      math.pi / 2,
+      false,
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
