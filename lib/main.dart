@@ -594,7 +594,31 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
                               anim: _pulseA,
                               time: _getTime(),
                             )
-                          : const SizedBox(key: ValueKey('i'), width: 80),
+                          : GestureDetector(
+                              key: const ValueKey('i'),
+                              onTap: _logout,
+                              child: Container(
+                                width: 80,
+                                alignment: Alignment.centerLeft,
+                                child: Container(
+                                  width: 36,
+                                  height: 36,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0x26FFFFFF),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                      color: const Color(0x33FFFFFF),
+                                      width: 0.8,
+                                    ),
+                                  ),
+                                  child: const Icon(
+                                    Icons.logout_rounded,
+                                    color: Colors.white60,
+                                    size: 16,
+                                  ),
+                                ),
+                              ),
+                            ),
                     ),
 
                     _sw(
