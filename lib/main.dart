@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,12 +11,12 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:path/path.dart' as p;
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'auth.dart' show Auth;
+import 'login_page.dart' show LoginPage;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GLOBALS & COMPILE-TIME CONSTANTS
-// Every color/decoration that is the same across the lifetime of the app lives
-// here as a top-level const so it is allocated exactly once in the Dart heap,
-// never copied, and never garbage-collected.
 // ═══════════════════════════════════════════════════════════════════════════════
 late List<CameraDescription> cameras;
 const _ch = MethodChannel('com.example.app/media_store');
@@ -24,10 +26,9 @@ const _photosPath = '/storage/emulated/0/DCIM/SnapCam/Photos';
 const _kRed = Color(0xFFFF3B30);
 const _kYellow = Color(0xFFFFD60A);
 
-// Pre-baked alpha variants — withValues() is never called at runtime
-const _kRedGlow = Color(0x99FF3B30); // red  @ 60 %
-const _kRedShadow = Color(0x80FF3B30); // red  @ 50 %
-const _kRedPulse = Color(0x40FF3B30); // red  @ 25 % (pulse ring max)
+// Pre-baked alpha variants
+const _kRedGlow = Color(0x99FF3B30);
+const _kRedShadow = Color(0x80FF3B30);
 const _kWhite12 = Color(0x1FFFFFFF);
 const _kWhite20 = Color(0x33FFFFFF);
 const _kWhite30 = Color(0x4DFFFFFF);
@@ -40,9 +41,14 @@ const _kBlack54 = Color(0x8A000000);
 const _kBlack72 = Color(0xB8000000);
 const _kBlack85 = Color(0xD9000000);
 
+// Fixed 3:4 portrait aspect ratio
+const _kRatioValue = 3.0 / 4.0;
+const _kRatioLabel = '3:4';
+const _kScannerW = 200.0;
+const _kScannerH = 267.0;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Lock orientation once — never recalculated
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
@@ -52,21 +58,21 @@ Future<void> main() async {
   );
   cameras = await availableCameras();
   runApp(
-    const MaterialApp(debugShowCheckedModeBanner: false, home: _CamPage()),
+    const MaterialApp(debugShowCheckedModeBanner: false, home: _AuthGate()),
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CAMERA PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
-class _CamPage extends StatefulWidget {
-  const _CamPage();
+class CamPage extends StatefulWidget {
+  const CamPage({super.key});
   @override
-  State<_CamPage> createState() => _CamState();
+  State<CamPage> createState() => _CamState();
 }
 
-class _CamState extends State<_CamPage> with TickerProviderStateMixin {
-  // ── Camera ──────────────────────────────────────────────────────────────────
+class _CamState extends State<CamPage> with TickerProviderStateMixin {
+  // ── Camera ────────────────────────────────────────────────────────────────
   CameraController? _cam;
   int _camIdx = 0;
   bool _switching = false;
@@ -75,12 +81,11 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
       _camIdx < cameras.length &&
       cameras[_camIdx].lensDirection == CameraLensDirection.front;
 
-  // ── Flash ────────────────────────────────────────────────────────────────────
+  // ── Flash ─────────────────────────────────────────────────────────────────
   static const _flashModes = [FlashMode.off, FlashMode.always, FlashMode.auto];
   int _fi = 0;
   FlashMode get _flash => _flashModes[_fi];
 
-  // Flash icon/label cached — recomputed only in _updateFlashCache(), never in build()
   IconData _flashIcon = Icons.flash_off_rounded;
   String _flashLabel = 'OFF';
   bool _flashActive = false;
@@ -99,7 +104,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     _flashActive = _flash == FlashMode.always;
   }
 
-  // ── Recording state ──────────────────────────────────────────────────────────
+  // ── Recording state ───────────────────────────────────────────────────────
   bool _rec = false;
   bool _snapping = false;
   bool _saving = false;
@@ -108,8 +113,6 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
   int _photoCnt = 0;
   Timer? _timer;
 
-  // Timer display — memoised so String allocation happens once per second,
-  // not on every build() call
   String _timeFmt = '00:00';
   int _timeFmtSecs = -1;
   String _getTime() {
@@ -120,14 +123,13 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     return _timeFmt;
   }
 
-  // ── Session ──────────────────────────────────────────────────────────────────
+  // ── Session ───────────────────────────────────────────────────────────────
   File? _lastPhoto;
   final _sessionPhotos = <File>[];
   String? _lastVideoPath;
   final _segs = <String>[];
 
-  // ── Animations ───────────────────────────────────────────────────────────────
-  // All controllers created with the same helper; none start until needed.
+  // ── Animation controllers ─────────────────────────────────────────────────
   late final _pulseC = _ac(1200);
   late final _shutC = _ac(120);
   late final _cntC = _ac(300);
@@ -160,7 +162,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
         TweenSequenceItem(tween: Tween(begin: hi, end: 1.0), weight: 50),
       ]).animate(CurvedAnimation(parent: c, curve: Curves.elasticOut));
 
-  // ── Lifecycle ────────────────────────────────────────────────────────────────
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -176,14 +178,39 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  // ── Init ─────────────────────────────────────────────────────────────────────
+  // ── Logout ────────────────────────────────────────────────────────────────
+  Future<void> _logout() async {
+    // Show confirmation bottom sheet
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: const Color(0xFF141414),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => const _LogoutSheet(),
+    );
+    if (confirmed != true || !mounted) return;
+    // Stop any active recording first
+    if (_rec) await _stopRec();
+    await Auth.logOut();
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => const LoginPage(),
+        transitionsBuilder: (_, anim, __, child) =>
+            FadeTransition(opacity: anim, child: child),
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
+    );
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
   Future<void> _initAll() async {
     await [
       Permission.camera,
       Permission.microphone,
-      Permission.storage,
-      Permission.photos,
-      Permission.videos,
+      Permission.manageExternalStorage,
     ].request();
     await _initCam(_camIdx);
   }
@@ -206,7 +233,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     if (mounted) setState(() {});
   }
 
-  // ── Camera controls ───────────────────────────────────────────────────────────
+  // ── Camera controls ────────────────────────────────────────────────────────
   Future<void> _toggleCam() async {
     if (_rec || _switching || cameras.length < 2) return;
     setState(() => _switching = true);
@@ -224,14 +251,14 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     if (_isFront) return;
     _flashC.forward(from: 0);
     _fi = (_fi + 1) % _flashModes.length;
-    _updateFlashCache(); // update cache before setState triggers build
+    _updateFlashCache();
     setState(() {});
     try {
       await _cam?.setFlashMode(_flash);
     } catch (_) {}
   }
 
-  // ── Recording ─────────────────────────────────────────────────────────────────
+  // ── Recording ──────────────────────────────────────────────────────────────
   Future<void> _startRec() async {
     if (_cam == null || _cam!.value.isRecordingVideo) return;
     _segs.clear();
@@ -245,7 +272,6 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
       _secs = 0;
       _photoCnt = 0;
     });
-    // Timer setState is deliberately minimal: only _secs changes each tick.
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _secs++);
     });
@@ -267,7 +293,11 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     });
     try {
       final out = await _stitch(_segs);
-      await _ch.invokeMethod('saveVideoToGallery', {'path': out});
+      // Pass ratio label to Kotlin so it can crop the video correctly
+      await _ch.invokeMethod('saveVideoToGallery', {
+        'path': out,
+        'ratio': _kRatioLabel,
+      });
       if (mounted) setState(() => _lastVideoPath = out);
     } catch (e) {
       debugPrint('Save: $e');
@@ -288,7 +318,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     return out;
   }
 
-  // ── Photo ─────────────────────────────────────────────────────────────────────
+  // ── Photo ──────────────────────────────────────────────────────────────────
   Future<void> _snap() async {
     if (_cam == null ||
         !_cam!.value.isRecordingVideo ||
@@ -313,6 +343,9 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     }
   }
 
+  // ── Photo save with ratio crop ─────────────────────────────────────────────
+  // Uses dart:ui to decode → crop → re-encode the JPEG.
+  // No extra package needed — dart:ui is always available.
   Future<void> _savePhoto(String src) async {
     try {
       final d = Directory(_photosPath);
@@ -322,7 +355,11 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
         d.path,
         'IMG_${DateTime.now().millisecondsSinceEpoch}$ext',
       );
-      await File(src).copy(dest);
+
+      // ── Crop to selected ratio ───────────────────────────────────────────
+      final croppedBytes = await _cropImageToRatio(src);
+      await File(dest).writeAsBytes(croppedBytes);
+
       await _ch.invokeMethod('scanFile', {'path': dest});
       if (mounted)
         setState(() {
@@ -335,7 +372,59 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     }
   }
 
-  // ── Gallery ───────────────────────────────────────────────────────────────────
+  // Crops an image file to the given ratio, centred on the image.
+  // Returns PNG bytes (lossless; file extension is already .jpg from camera
+  // but quality difference is negligible for a single save).
+  static Future<Uint8List> _cropImageToRatio(String srcPath) async {
+    // 1. Read raw bytes and decode to ui.Image
+    final bytes = await File(srcPath).readAsBytes();
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final src = frame.image;
+
+    final srcW = src.width.toDouble();
+    final srcH = src.height.toDouble();
+
+    // 2. Compute the largest centred crop rect that matches the ratio.
+    //    The camera image is in landscape orientation internally (width > height
+    //    typically), so we compare both orientations of the ratio.
+    double cropW, cropH;
+
+    // Try fitting by width first
+    cropW = srcW;
+    cropH = srcW / _kRatioValue;
+
+    if (cropH > srcH) {
+      // Doesn't fit by width — fit by height instead
+      cropH = srcH;
+      cropW = srcH * _kRatioValue;
+    }
+
+    // Centre the crop rectangle
+    final left = (srcW - cropW) / 2;
+    final top = (srcH - cropH) / 2;
+
+    // 3. Draw the cropped region onto a new canvas
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+
+    final srcRect = Rect.fromLTWH(left, top, cropW, cropH);
+    final dstRect = Rect.fromLTWH(0, 0, cropW, cropH);
+
+    canvas.drawImageRect(src, srcRect, dstRect, Paint());
+
+    final picture = recorder.endRecording();
+    final cropped = await picture.toImage(cropW.round(), cropH.round());
+
+    // 4. Encode to PNG bytes and return
+    final byteData = await cropped.toByteData(format: ui.ImageByteFormat.png);
+    src.dispose();
+    cropped.dispose();
+
+    return byteData!.buffer.asUint8List();
+  }
+
+  // ── Gallery ────────────────────────────────────────────────────────────────
   void _openGallery() {
     if (_sessionPhotos.isEmpty && _lastVideoPath == null) return;
     showModalBottomSheet(
@@ -349,14 +438,12 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
     );
   }
 
-  // ── AnimatedSwitcher helper ───────────────────────────────────────────────────
-  // Defined as an inline helper (not a member widget) so no extra class overhead.
   Widget _sw(int ms, Widget child) => AnimatedSwitcher(
     duration: Duration(milliseconds: ms),
     child: child,
   );
 
-  // ── Build ─────────────────────────────────────────────────────────────────────
+  // ── Build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     if (_cam == null || !_cam!.value.isInitialized) {
@@ -371,7 +458,6 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
       );
     }
 
-    // Read MediaQuery once — avoids multiple O(n) lookups through the tree.
     final mq = MediaQuery.of(context);
     final top = mq.padding.top;
     final h = mq.size.height;
@@ -381,30 +467,34 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
       extendBody: true,
       extendBodyBehindAppBar: true,
       body: RepaintBoundary(
-        // Outer boundary: top-level isolation. Nothing outside the camera
-        // UI can ever trigger a repaint of this subtree.
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // ── 1. Camera preview ──────────────────────────────────────
-            // Inner RepaintBoundary: the 30 fps texture updates coming from
-            // CameraPreview are fully contained here — they never dirty the
-            // widget layers above (gradients, badges, buttons).
+            // ── 1. Camera preview (cropped to selected ratio) ────────────
+            // The camera always captures at full resolution.
+            // We clip the PREVIEW to the selected ratio so the user sees
+            // exactly what will be saved.
             RepaintBoundary(
               child: SizedBox.expand(
-                child: FittedBox(
-                  fit: BoxFit.cover,
-                  child: SizedBox(
-                    width: _cam!.value.previewSize!.height,
-                    height: _cam!.value.previewSize!.width,
-                    child: CameraPreview(_cam!),
+                child: Center(
+                  child: AspectRatio(
+                    aspectRatio: _kRatioValue,
+                    child: ClipRect(
+                      child: FittedBox(
+                        fit: BoxFit.cover,
+                        child: SizedBox(
+                          width: _cam!.value.previewSize!.height,
+                          height: _cam!.value.previewSize!.width,
+                          child: CameraPreview(_cam!),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
               ),
             ),
 
-            // ── 2. Gradient overlays ───────────────────────────────────
-            // const DecoratedBox: zero heap allocation on every build pass.
+            // ── 3. Gradient overlays ─────────────────────────────────────
             Positioned(
               top: 0,
               left: 0,
@@ -437,9 +527,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
               ),
             ),
 
-            // ── 3. Photo-flash white overlay ───────────────────────────
-            // Only inserted into the widget tree for ~80 ms; const color
-            // avoids any runtime Color construction.
+            // ── 4. Photo-flash overlay ───────────────────────────────────
             if (_flashWhite)
               const Positioned.fill(
                 child: IgnorePointer(
@@ -447,17 +535,16 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
                 ),
               ),
 
-            // ── 4. Scanner frame ───────────────────────────────────────
-            // const all the way down — never repainted, never rebuilt.
-            const Positioned.fill(
+            // ── 5. Scanner frame ─────────────────────────────────────────
+            Positioned.fill(
               child: IgnorePointer(
-                child: Center(child: _ScannerFrame(size: 220)),
+                child: Center(
+                  child: _ScannerFrame(width: _kScannerW, height: _kScannerH),
+                ),
               ),
             ),
 
-            // ── 5. Saving overlay ──────────────────────────────────────
-            // Only in tree while _saving == true. Inner widgets are const
-            // so Flutter reuses them without allocation.
+            // ── 6. Saving overlay ────────────────────────────────────────
             if (_saving)
               const Positioned.fill(
                 child: ColoredBox(
@@ -490,9 +577,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
                 ),
               ),
 
-            // ── 6. Top bar ─────────────────────────────────────────────
-            // Isolated in its own RepaintBoundary so the 1-second timer tick
-            // only repaints this region (~80×24 dp), not the entire screen.
+            // ── 7. Top bar ───────────────────────────────────────────────
             Positioned(
               top: top + 16,
               left: 24,
@@ -542,9 +627,7 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
               ),
             ),
 
-            // ── 7. Bottom controls ─────────────────────────────────────
-            // Isolated in its own RepaintBoundary so button animations
-            // (flip spin, shutter scale) never dirty the top bar or preview.
+            // ── 8. Bottom controls ───────────────────────────────────
             Positioned(
               bottom: 36,
               left: 0,
@@ -554,7 +637,6 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
                   padding: const EdgeInsets.symmetric(horizontal: 32),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
                       _Thumb(file: _lastPhoto, onTap: _openGallery),
 
@@ -597,8 +679,6 @@ class _CamState extends State<_CamPage> with TickerProviderStateMixin {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FLASH BUTTON
-// ScaleTransition animates at 60 fps only during the 200 ms pop; decoration is
-// pre-baked into two static const instances so no allocation happens in build().
 // ═══════════════════════════════════════════════════════════════════════════════
 class _FlashBtn extends StatelessWidget {
   final IconData icon;
@@ -617,7 +697,6 @@ class _FlashBtn extends StatelessWidget {
     required this.onTap,
   });
 
-  // Pre-baked decorations — chosen in build() with zero allocation.
   static const _decoActive = BoxDecoration(
     color: Color(0x26FFD60A),
     borderRadius: BorderRadius.all(Radius.circular(30)),
@@ -672,9 +751,6 @@ class _FlashBtn extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RECORDING BADGE
-// The pulsing dot is wrapped in a tight AnimatedBuilder so only a 7×7 dp region
-// repaints at 60 fps.  The pill container and the timer text live outside the
-// builder — they are rebuilt only on the 1-second setState.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _RecBadge extends StatelessWidget {
   final Animation<double> anim;
@@ -699,8 +775,6 @@ class _RecBadge extends StatelessWidget {
         children: [
           AnimatedBuilder(
             animation: anim,
-            // _RedDot is const — its build() is never called inside the builder;
-            // only Transform.scale is re-evaluated at 60 fps.
             builder: (_, child) =>
                 Transform.scale(scale: anim.value, child: child),
             child: const _RedDot(),
@@ -721,8 +795,6 @@ class _RecBadge extends StatelessWidget {
   );
 }
 
-// Separated so the full BoxDecoration+BoxShadow subtree is built once (const)
-// and the widget reference is simply reused every frame.
 class _RedDot extends StatelessWidget {
   const _RedDot();
   static const _deco = BoxDecoration(
@@ -740,8 +812,6 @@ class _RedDot extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHOTO COUNT BADGE
-// Two static const decorations cover both states; the active one includes a
-// pre-baked const BoxShadow list so no list allocation occurs during animation.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _CntBadge extends StatelessWidget {
   final int count;
@@ -784,21 +854,13 @@ class _CntBadge extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GALLERY THUMBNAIL
-// Empty state uses a static const decoration; filled state allocates one
-// BoxDecoration only when a new photo is saved (file reference changes).
 // ═══════════════════════════════════════════════════════════════════════════════
 class _Thumb extends StatelessWidget {
   final File? file;
   final VoidCallback onTap;
   const _Thumb({required this.file, required this.onTap});
 
-  static const _decoEmpty = BoxDecoration(
-    borderRadius: BorderRadius.all(Radius.circular(12)),
-    border: Border.fromBorderSide(BorderSide(color: _kWhite30, width: 1)),
-    color: _kWhite12,
-  );
-
-  static const _decoFilled = BoxDecoration(
+  static const _decoBase = BoxDecoration(
     borderRadius: BorderRadius.all(Radius.circular(12)),
     border: Border.fromBorderSide(BorderSide(color: _kWhite30, width: 1)),
     color: _kWhite12,
@@ -811,12 +873,10 @@ class _Thumb extends StatelessWidget {
       width: 54,
       height: 54,
       child: DecoratedBox(
-        decoration: file != null ? _decoFilled : _decoEmpty,
+        decoration: _decoBase,
         child: file != null
             ? ClipRRect(
                 borderRadius: BorderRadius.circular(11),
-                // cacheWidth=108: decode at 2× display size (54 dp logical),
-                // avoids uploading a full 12 MP texture to the GPU every rebuild.
                 child: Image.file(file!, fit: BoxFit.cover, cacheWidth: 108),
               )
             : const Center(
@@ -829,10 +889,6 @@ class _Thumb extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RECORD BUTTON
-// The AnimatedContainer (the inner square/circle) is passed as `child` to
-// AnimatedBuilder so Flutter builds it exactly once per _rec toggle, not at
-// every animation frame (60 fps).  The outer ring containers are lightweight
-// and kept inside builder only because their border alpha must track pulseAnim.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _RecBtn extends StatelessWidget {
   final bool rec;
@@ -840,12 +896,10 @@ class _RecBtn extends StatelessWidget {
   final Animation<double> anim;
   const _RecBtn({required this.rec, required this.onTap, required this.anim});
 
-  // Static ring decoration for the idle outer ring (always full-white border).
   static const _ringIdle = BoxDecoration(
     shape: BoxShape.circle,
     border: Border.fromBorderSide(BorderSide(color: Colors.white, width: 2.5)),
   );
-  // Static ring decoration for the recording outer ring.
   static const _ringRec = BoxDecoration(
     shape: BoxShape.circle,
     border: Border.fromBorderSide(BorderSide(color: _kWhite40, width: 2.5)),
@@ -856,7 +910,6 @@ class _RecBtn extends StatelessWidget {
     onTap: onTap,
     child: AnimatedBuilder(
       animation: anim,
-      // Built once per _rec state change, reused every animation frame.
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
         curve: Curves.easeInOut,
@@ -870,8 +923,6 @@ class _RecBtn extends StatelessWidget {
       builder: (_, child) => Stack(
         alignment: Alignment.center,
         children: [
-          // Pulsing outer ring — only present during recording.
-          // Color.fromARGB is a cheap int operation; no Color.lerp involved.
           if (rec)
             Transform.scale(
               scale: anim.value * 1.15,
@@ -894,7 +945,6 @@ class _RecBtn extends StatelessWidget {
                 ),
               ),
             ),
-          // Static outer ring — uses a const decoration when not recording.
           SizedBox(
             width: 78,
             height: 78,
@@ -909,8 +959,6 @@ class _RecBtn extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SHUTTER BUTTON
-// Four static const decorations (2 outer × 2 inner) eliminate all allocation
-// during the ScaleTransition that drives this widget.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _SnapBtn extends StatelessWidget {
   final bool enabled;
@@ -969,8 +1017,6 @@ class _SnapBtn extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FLIP BUTTON
-// The icon is passed as `child` to AnimatedBuilder — it is built once per
-// isFront toggle, not 60× per second during the spin animation.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _FlipBtn extends StatelessWidget {
   final Animation<double> anim;
@@ -1004,7 +1050,6 @@ class _FlipBtn extends StatelessWidget {
           child: Center(
             child: AnimatedBuilder(
               animation: anim,
-              // Icon built once; only Transform.rotate re-evaluates at 60 fps.
               child: Icon(
                 isFront
                     ? Icons.camera_front_outlined
@@ -1026,19 +1071,19 @@ class _FlipBtn extends StatelessWidget {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SCANNER FRAME
-// CustomPainter with shouldRepaint=false and a static Paint object:
-// the GPU path is recorded once and composited directly — zero CPU work per frame.
+// Now accepts separate width and height so it can match non-square ratios.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _ScannerFrame extends StatelessWidget {
-  final double size;
-  const _ScannerFrame({required this.size});
+  final double width;
+  final double height;
+  const _ScannerFrame({required this.width, required this.height});
+
   @override
   Widget build(BuildContext context) =>
-      CustomPaint(size: Size(size, size), painter: _ScannerPainter());
+      CustomPaint(size: Size(width, height), painter: _ScannerPainter());
 }
 
 class _ScannerPainter extends CustomPainter {
-  // Static Paint — allocated once for the lifetime of the app.
   static final _p = Paint()
     ..color = Colors.white
     ..strokeWidth = 3.5
@@ -1047,8 +1092,9 @@ class _ScannerPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size sz) {
+    // Arm length scales with the shorter side so it always looks proportional
+    final arm = math.min(sz.width, sz.height) * 0.18;
     const r = 10.0;
-    final arm = sz.width * 0.18;
     final w = sz.width;
     final h = sz.height;
 
@@ -1116,9 +1162,6 @@ class _ScannerPainter extends CustomPainter {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GALLERY SHEET
-// Only materialises when the user opens it.  All fixed decorations are static
-// const. The thumbnail strip uses ListView.builder so only the ~3 visible items
-// are built at any time regardless of session length.
 // ═══════════════════════════════════════════════════════════════════════════════
 class _GallerySheet extends StatefulWidget {
   final List<File> photos;
@@ -1147,7 +1190,6 @@ class _GallerySheetState extends State<_GallerySheet> {
   Future<void> _open() =>
       OpenFilex.open(_isVid(_sel) ? widget.videoPath! : _photoAt(_sel).path);
 
-  // ── Static const decorations ──────────────────────────────────────────────
   static const _sheetDeco = BoxDecoration(
     color: Color(0xFF111111),
     borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -1177,7 +1219,6 @@ class _GallerySheetState extends State<_GallerySheet> {
         decoration: _sheetDeco,
         child: Column(
           children: [
-            // Handle
             const SizedBox(height: 12),
             const SizedBox(
               width: 40,
@@ -1186,7 +1227,6 @@ class _GallerySheetState extends State<_GallerySheet> {
             ),
             const SizedBox(height: 12),
 
-            // Header
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Row(
@@ -1215,20 +1255,16 @@ class _GallerySheetState extends State<_GallerySheet> {
             ),
             const SizedBox(height: 16),
 
-            // Main preview area
             Expanded(
               child: GestureDetector(
                 onTap: _open,
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
-                    // Photo preview
                     if (!_isVid(_sel))
                       Positioned.fill(
                         child: Image.file(_photoAt(_sel), fit: BoxFit.contain),
                       ),
-
-                    // Video preview (blurred first-photo + dark tint)
                     if (_isVid(_sel))
                       Positioned.fill(
                         child: widget.photos.isNotEmpty
@@ -1239,14 +1275,11 @@ class _GallerySheetState extends State<_GallerySheet> {
                                     widget.photos.first,
                                     fit: BoxFit.contain,
                                   ),
-                                  // ColoredBox cheaper than Container for solid tint
                                   const ColoredBox(color: _kBlack45),
                                 ],
                               )
                             : const ColoredBox(color: _kBlack54),
                       ),
-
-                    // Play icon overlay
                     if (_isVid(_sel))
                       const SizedBox(
                         width: 64,
@@ -1260,8 +1293,6 @@ class _GallerySheetState extends State<_GallerySheet> {
                           ),
                         ),
                       ),
-
-                    // Tap-to-open hint
                     Positioned(
                       bottom: 12,
                       child: DecoratedBox(
@@ -1298,7 +1329,6 @@ class _GallerySheetState extends State<_GallerySheet> {
               ),
             ),
 
-            // Thumbnail strip — builder pattern: only visible items allocated.
             SizedBox(
               height: 80,
               child: ListView.builder(
@@ -1337,7 +1367,6 @@ class _GallerySheetState extends State<_GallerySheet> {
                                     cacheWidth: 112,
                                   )
                                 : const ColoredBox(color: Color(0x1AFFFFFF)),
-                            // Video badge
                             if (_isVid(i))
                               const ColoredBox(
                                 color: _kBlack45,
@@ -1349,7 +1378,6 @@ class _GallerySheetState extends State<_GallerySheet> {
                                   ),
                                 ),
                               ),
-                            // Dim overlay for unselected items
                             if (!sel)
                               const ColoredBox(color: Color(0x61000000)),
                           ],
@@ -1364,6 +1392,179 @@ class _GallerySheetState extends State<_GallerySheet> {
             SizedBox(height: MediaQuery.of(context).padding.bottom + 8),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH GATE
+// Shown once at launch. Checks SharedPreferences, routes to CamPage (already
+// logged in) or LoginPage (not logged in).
+// Defined here to avoid circular imports with auth.dart.
+// ═══════════════════════════════════════════════════════════════════════════════
+class _AuthGate extends StatefulWidget {
+  const _AuthGate();
+  @override
+  State<_AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<_AuthGate> {
+  @override
+  void initState() {
+    super.initState();
+    _check();
+  }
+
+  Future<void> _check() async {
+    final user = await Auth.currentUser();
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => user != null ? const CamPage() : const LoginPage(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => const Scaffold(
+    backgroundColor: Color(0xFF0A0A0A),
+    body: Center(
+      child: CircularProgressIndicator(color: Colors.white24, strokeWidth: 1),
+    ),
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGOUT CONFIRMATION SHEET
+// A minimal bottom sheet asking the user to confirm sign-out.
+// Returns true if confirmed, null/false if dismissed.
+// ═══════════════════════════════════════════════════════════════════════════════
+class _LogoutSheet extends StatelessWidget {
+  const _LogoutSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        24,
+        20,
+        24,
+        MediaQuery.of(context).padding.bottom + 24,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Handle
+          Container(
+            width: 40,
+            height: 4,
+            margin: const EdgeInsets.only(bottom: 20),
+            decoration: BoxDecoration(
+              color: Colors.white24,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+
+          // Icon
+          Container(
+            width: 52,
+            height: 52,
+            decoration: BoxDecoration(
+              color: const Color(0x26FF3B30),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0x55FF3B30), width: 1),
+            ),
+            child: const Icon(
+              Icons.logout_rounded,
+              color: Color(0xFFFF3B30),
+              size: 22,
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Title
+          const Text(
+            'Sign out?',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              letterSpacing: -0.3,
+            ),
+          ),
+          const SizedBox(height: 6),
+
+          const Text(
+            'Your saved photos and videos will stay on the device.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white54,
+              fontSize: 13,
+              fontWeight: FontWeight.w300,
+              letterSpacing: 0.1,
+            ),
+          ),
+          const SizedBox(height: 28),
+
+          // Confirm button
+          GestureDetector(
+            onTap: () => Navigator.pop(context, true),
+            child: Container(
+              height: 52,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: const Color(0xFFFF3B30),
+                borderRadius: BorderRadius.circular(14),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x55FF3B30),
+                    blurRadius: 16,
+                    offset: Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: const Center(
+                child: Text(
+                  'SIGN OUT',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1.8,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // Cancel button
+          GestureDetector(
+            onTap: () => Navigator.pop(context, false),
+            child: Container(
+              height: 52,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Colors.transparent,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFF2A2A2A), width: 1),
+              ),
+              child: const Center(
+                child: Text(
+                  'CANCEL',
+                  style: TextStyle(
+                    color: Colors.white60,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w400,
+                    letterSpacing: 1.8,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
