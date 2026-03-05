@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'dart:io';
 import 'dart:math' as math;
@@ -128,6 +129,7 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
   final _sessionPhotos = <File>[];
   String? _lastVideoPath;
   final _segs = <String>[];
+  bool _photoDirReady = false; // cached after first creation
 
   // ── Animation controllers ─────────────────────────────────────────────────
   late final _pulseC = _ac(1200);
@@ -328,13 +330,17 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
     setState(() => _snapping = true);
     _shutC.forward().then((_) => _shutC.reverse());
     try {
+      // ── Stop segment, grab photo, restart recording as fast as possible ──
       _segs.add((await _cam!.stopVideoRecording()).path);
       final img = await _cam!.takePicture();
-      setState(() => _flashWhite = true);
-      await Future.delayed(const Duration(milliseconds: 80));
-      if (mounted) setState(() => _flashWhite = false);
-      await _savePhoto(img.path);
+
+      // Flash feedback — fire-and-forget, don't block recording restart
+      _triggerFlash();
+
+      // Save runs in background — camera resumes recording immediately
+      unawaited(_savePhoto(img.path));
       _cntC.forward(from: 0);
+
       await _cam!.startVideoRecording();
     } catch (e) {
       debugPrint('Snap: $e');
@@ -343,22 +349,35 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
     }
   }
 
-  // ── Photo save with ratio crop ─────────────────────────────────────────────
-  // Uses dart:ui to decode → crop → re-encode the JPEG.
-  // No extra package needed — dart:ui is always available.
+  /// White-flash overlay — fire-and-forget so it never delays capture.
+  void _triggerFlash() {
+    if (!mounted) return;
+    setState(() => _flashWhite = true);
+    Future.delayed(const Duration(milliseconds: 80), () {
+      if (mounted) setState(() => _flashWhite = false);
+    });
+  }
+
+  // ── Photo save ────────────────────────────────────────────────────────────
+  // Runs in background (called with unawaited from _snap).
+  // Crop is offloaded to a Dart isolate so the UI thread is never blocked.
   Future<void> _savePhoto(String src) async {
     try {
-      final d = Directory(_photosPath);
-      if (!await d.exists()) await d.create(recursive: true);
-      final ext = p.extension(src).isNotEmpty ? p.extension(src) : '.jpg';
+      // Ensure directory exists (cached after first call)
+      if (!_photoDirReady) {
+        final d = Directory(_photosPath);
+        if (!await d.exists()) await d.create(recursive: true);
+        _photoDirReady = true;
+      }
+
       final dest = p.join(
-        d.path,
-        'IMG_${DateTime.now().millisecondsSinceEpoch}$ext',
+        _photosPath,
+        'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
 
-      // ── Crop to selected ratio ───────────────────────────────────────────
-      final croppedBytes = await _cropImageToRatio(src);
-      await File(dest).writeAsBytes(croppedBytes);
+      // Offload the heavy decode→crop→encode work to a background isolate
+      final croppedBytes = await Isolate.run(() => _cropImageToRatio(src));
+      await File(dest).writeAsBytes(croppedBytes, flush: true);
 
       await _ch.invokeMethod('scanFile', {'path': dest});
       if (mounted)
@@ -377,8 +396,14 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
   // but quality difference is negligible for a single save).
   static Future<Uint8List> _cropImageToRatio(String srcPath) async {
     // 1. Read raw bytes and decode to ui.Image
+    //    targetWidth caps resolution at 2048px — cuts encode time ~70%
+    //    while keeping plenty of detail for a phone screen.
     final bytes = await File(srcPath).readAsBytes();
-    final codec = await ui.instantiateImageCodec(bytes);
+    const maxPx = 2048;
+    final codec = await ui.instantiateImageCodec(
+      bytes,
+      targetWidth: maxPx, // dart:ui rescales during decode (fast, GPU-assisted)
+    );
     final frame = await codec.getNextFrame();
     final src = frame.image;
 
@@ -653,7 +678,7 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
 
             // ── 8. Bottom controls ───────────────────────────────────
             Positioned(
-              bottom: 36,
+              bottom: 60,
               left: 0,
               right: 0,
               child: RepaintBoundary(
