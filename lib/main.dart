@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
+//import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -341,8 +341,9 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
   // ── Recording ─────────────────────────────────────────────────────────────────
   Future<void> _startRec() async {
     final cam = _cam;
-    if (cam == null || !cam.value.isInitialized || cam.value.isRecordingVideo)
+    if (cam == null || !cam.value.isInitialized || cam.value.isRecordingVideo) {
       return;
+    }
 
     // Verify microphone permission before attempting to record.
     if (!await Permission.microphone.isGranted) {
@@ -448,8 +449,9 @@ class _CamState extends State<CamPage> with TickerProviderStateMixin {
     if (cam == null ||
         !cam.value.isInitialized ||
         !cam.value.isRecordingVideo ||
-        _snapping)
+        _snapping) {
       return;
+    }
 
     setState(() => _snapping = true);
     _shutC.forward().then((_) => _shutC.reverse());

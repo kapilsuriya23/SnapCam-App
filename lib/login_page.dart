@@ -122,8 +122,10 @@ class _LoginPageState extends State<LoginPage>
                     hint: 'Email address',
                     keyboard: TextInputType.emailAddress,
                     validator: (v) {
-                      if (v == null || v.trim().isEmpty)
+                      if (v == null || v.trim().isEmpty) {
                         return 'Enter your email';
+                      }
+
                       if (!v.contains('@')) return 'Enter a valid email';
                       return null;
                     },
