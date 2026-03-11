@@ -25,15 +25,6 @@ SnapCam App is a Flutter-based mobile application that allows users to capture v
 
 ---
 
-## 📱 Screenshots
-
-<!-- Add screenshots later -->
-| Home Screen | Camera Screen |
-|-------------|--------------|
-| Coming Soon | Coming Soon |
-
----
-
 ## ⚙️ Installation & Setup
 
 Follow these steps to run the project locally:
